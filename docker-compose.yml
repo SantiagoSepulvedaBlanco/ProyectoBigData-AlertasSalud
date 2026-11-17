@@ -1,0 +1,150 @@
+# =============================================================================
+# Sistema de Alertas de Salud en Tiempo Real - Infraestructura
+# Kafka (KRaft) + Flink 1.18 + PostgreSQL/TimescaleDB + generador + dashboard
+#
+# Puntos de acceso desde tu laptop:
+#   Kafka     -> localhost:9092
+#   Flink UI  -> http://localhost:8081
+#   Dashboard -> http://localhost:8501
+#   Postgres  -> localhost:5432  (user/pass: health/health, db: health)
+# Entre contenedores Kafka se alcanza en kafka:29092 y Postgres en postgres:5432.
+# Usa ./start.sh: respeta el orden correcto de arranque.
+# =============================================================================
+
+x-flink: &flink
+  image: flink:1.18.1
+  environment:
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: jobmanager
+      taskmanager.numberOfTaskSlots: 4
+      parallelism.default: 3
+      restart-strategy: fixed-delay
+      restart-strategy.fixed-delay.attempts: 10
+      restart-strategy.fixed-delay.delay: 5 s
+  volumes:
+    # Montados como archivos individuales para NO sobrescribir /opt/flink/lib
+    - ./flink-libs/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar:ro
+    - ./flink-libs/flink-json-1.18.1.jar:/opt/flink/lib/flink-json-1.18.1.jar:ro
+    - ./flink-libs/flink-connector-jdbc-3.1.2-1.18.jar:/opt/flink/lib/flink-connector-jdbc-3.1.2-1.18.jar:ro
+    - ./flink-libs/postgresql-42.7.3.jar:/opt/flink/lib/postgresql-42.7.3.jar:ro
+    - ./job.sql:/opt/flink/job.sql:ro
+
+x-app-build: &app
+  build: .
+  restart: unless-stopped
+  environment:
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    SENSOR_TOPIC: sensor-vital-data
+    ALERT_TOPIC: alertas-emergencia
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_NAME: health
+    DB_USER: health
+    DB_PASSWORD: health
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"   # KRaft: sin Zookeeper
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: INTERNAL://kafka:29092,CONTROLLER://kafka:29093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_MS: 3600000          # 1 h (persistencia real vive en Postgres)
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: health-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: health
+      POSTGRES_USER: health
+      POSTGRES_PASSWORD: health
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U health -d health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  jobmanager:
+    <<: *flink
+    container_name: flink-jobmanager
+    hostname: jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  taskmanager:
+    <<: *flink
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+
+  generator:
+    <<: *app
+    container_name: health-generator
+    command: ["python", "-u", "generator.py"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SENSOR_TOPIC: sensor-vital-data
+      ALERT_TOPIC: alertas-emergencia
+      NUM_SENSORS: "1000"
+      EMIT_INTERVAL_SECONDS: "0.5"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  dashboard:
+    <<: *app
+    container_name: health-dashboard
+    command: ["streamlit", "run", "dashboard.py", "--server.port=8501",
+              "--server.address=0.0.0.0", "--server.headless=true",
+              "--browser.gatherUsageStats=false"]
+    ports:
+      - "8501:8501"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
